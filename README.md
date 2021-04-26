@@ -1,2 +1,2 @@
 # GFG
-Java Practice 
+Java Practice Programs
