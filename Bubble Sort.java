@@ -6,27 +6,37 @@ import java.io.*;
  // } Driver Code Ends
 //User function Template for Java
 
+
+
 class Solution
 {
     //Function to sort the array using bubble sort algorithm.
     public static void bubbleSort(int arr[], int n)
 	{
-	    int i, j;
-	    //Traversing over the array.
-        for (i = 0; i < n-1; i++)  
-        {
-            //Last i elements are already in place so we do not include them.
-            for (j = 0; j < n-i-1; j++)
+		boolean swapped;
+        //Traversing over the array.
+        for(int i = 0; i < n; i++){
             
-            if(arr[j] > arr[j+1])
-                {
-                    //Swapping, if the element at current index is greater 
+            swapped = false;
+             //Last i elements are already in place so we do not include them.
+            for(int j = 0; j < n - i - 1; j++){
+                if( arr[j] > arr[j + 1]){
+                    
+                    // swapping
+					//Swapping, if the element at current index is greater 
                     // than the next element. 
                     int temp = arr[j];
                     arr[j] = arr[j+1];
                     arr[j+1] = temp;
+                    
+                    swapped = true;
+                    
                 }
+            }
+            if(swapped == false)
+            break;
         }
+    }
             
 	}
 
