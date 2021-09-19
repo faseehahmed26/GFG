@@ -24,7 +24,7 @@ class Solution {
       if (arr[i] == 1) {
         numOf1s++;
         if (numOf1s == noOfOnesInEachPart + 1) {
-          indexOfFirst1InPart1 = i;
+          indexOfFirst1InPart1 = i; 
         } else if (numOf1s == 2 * noOfOnesInEachPart + 1) {
           indexOfFirst1InPart2 = i;
         } else if (numOf1s == 1) {
