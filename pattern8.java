@@ -27,7 +27,7 @@ class Test{
 /**
  * write a program to print the following pattern 
 
-
+,
 input = 3
 output =
 1
@@ -42,5 +42,24 @@ output =
 6*5*4
 7*8*9*10
 
+2nd Method
+import java.util.*;
+public class Main {
+	public static void main(String[] args) {
+		Scanner s=new Scanner (System.in);
+		int n=s.nextInt();
+		int g=1,x=1,d=0;
+		for(int i=1;i<=n;i++)
+		{
+			int y=x+1;
+			 d=i%2==1?(i*(g++)):(1);
+		     x=d;
+			for(int j=1;j<=i;j++){
+				System.out.print(i%2==0?(j==i?y+"\n":y++ + ""):(j==i?d+"\n":d-- + ""));
+			}
+		
+		}
+	}
+}
 
  */
