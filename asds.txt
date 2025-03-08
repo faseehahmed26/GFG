@@ -1,0 +1,511 @@
+import os
+import sys
+import json
+import pandas as pd
+import logging
+import datetime
+from datetime import date
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Tuple
+from sqlalchemy import create_engine, inspect, MetaData, Table, Column, text, exc
+from sqlalchemy.types import String, Integer, Float, Boolean, DateTime, TIMESTAMP, DECIMAL, VARCHAR
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("migration.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configuration - UPDATE THESE VALUES
+SOURCE_DB_CONFIG = {
+    "host": "source-redshift-cluster.region.redshift.amazonaws.com",
+    "port": "5439",
+    "database": "source_database",
+    "user": "username",
+    "password": "password",
+    "schema": "source_schema"  # Source schema name
+}
+
+TARGET_DB_CONFIG = {
+    "host": "target-redshift-cluster.region.redshift.amazonaws.com",
+    "port": "5439",
+    "database": "target_database",
+    "user": "username",
+    "password": "password"
+}
+
+TARGET_SCHEMA = "your_target_schema"  # Target schema name
+TABLE_WORKERS = 7  # Number of tables to process in parallel
+CHUNK_WORKERS = 4  # Number of chunks to process in parallel per table
+
+TABLES_TO_MIGRATE = [
+    "table1",
+    "table2",
+    "table3",
+    "table4",
+    "table5",
+    "table6", 
+    "table7"
+]
+
+# Manual data type overrides for specific columns
+MANUAL_DATA_TYPE_OVERRIDES = {
+    # Example:
+    # "table1": {
+    #     "column1": VARCHAR(500),  # Override default mapping for this column
+    # }
+}
+
+# Default settings
+DEFAULT_VARCHAR_SIZE = 255
+DEFAULT_NUMERIC_PRECISION = (18, 2)  # (precision, scale)
+CHUNK_SIZE = 100000  # Rows per chunk for processing
+
+# Connection pool for parallel processing
+connection_pools = {
+    'source': {},
+    'target': {}
+}
+
+def get_connection(db_type, worker_id=0):
+    """Get a database connection from the pool or create a new one"""
+    pool_key = f"{db_type}_{worker_id}"
+    
+    if pool_key not in connection_pools[db_type]:
+        # Create a new connection
+        if db_type == 'source':
+            config = SOURCE_DB_CONFIG
+        else:
+            config = TARGET_DB_CONFIG
+            
+        conn_uri = f"postgresql://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
+        connection_pools[db_type][pool_key] = create_engine(conn_uri, pool_size=10, max_overflow=20)
+        logger.debug(f"Created new {db_type} connection for worker {worker_id}")
+    
+    return connection_pools[db_type][pool_key]
+
+def get_qualified_table_name(table_name, schema=None):
+    """Get fully qualified table name with proper quoting"""
+    if schema:
+        return f'"{schema}"."{table_name}"'
+    return f'"{table_name}"'
+
+def get_table_schema(engine, table_name, schema=None):
+    """Retrieve table schema information"""
+    try:
+        inspector = inspect(engine)
+        columns = inspector.get_columns(table_name, schema=schema)
+        return {col['name']: col for col in columns}
+    except Exception as e:
+        logger.error(f"Error retrieving schema for {schema}.{table_name}: {str(e)}")
+        return {}
+
+def map_data_types(source_schema, table_name):
+    """Map source data types to target data types"""
+    type_mapping = {}
+    table_overrides = MANUAL_DATA_TYPE_OVERRIDES.get(table_name, {})
+    
+    for col_name, col_info in source_schema.items():
+        if col_name in table_overrides:
+            # Use manual override
+            type_mapping[col_name] = table_overrides[col_name]
+            logger.info(f"Using manual override for {table_name}.{col_name}")
+            continue
+        
+        # Get source type information
+        source_type = col_info['type']
+        type_str = str(source_type).upper()
+        
+        # Map to appropriate target type
+        if isinstance(source_type, String) or 'VARCHAR' in type_str or 'CHAR' in type_str:
+            try:
+                # Get length with fallback to default
+                length = getattr(source_type, 'length', DEFAULT_VARCHAR_SIZE)
+                # Add 10% buffer for safety
+                adjusted_length = min(int(length * 1.1), 65535)
+                type_mapping[col_name] = VARCHAR(adjusted_length)
+            except:
+                type_mapping[col_name] = VARCHAR(DEFAULT_VARCHAR_SIZE)
+        
+        elif 'INT' in type_str:
+            type_mapping[col_name] = Integer()
+        
+        elif 'FLOAT' in type_str or 'DOUBLE' in type_str:
+            type_mapping[col_name] = Float()
+        
+        elif 'BOOL' in type_str:
+            type_mapping[col_name] = Boolean()
+        
+        elif 'TIMESTAMP' in type_str or 'DATE' in type_str:
+            type_mapping[col_name] = TIMESTAMP()
+        
+        elif 'DECIMAL' in type_str or 'NUMERIC' in type_str:
+            try:
+                precision = getattr(source_type, 'precision', DEFAULT_NUMERIC_PRECISION[0])
+                scale = getattr(source_type, 'scale', DEFAULT_NUMERIC_PRECISION[1])
+                # Add buffer to precision
+                adjusted_precision = min(precision + 2, 38)
+                type_mapping[col_name] = DECIMAL(adjusted_precision, scale)
+            except:
+                type_mapping[col_name] = DECIMAL(*DEFAULT_NUMERIC_PRECISION)
+        
+        else:
+            # Default to VARCHAR for unknown types
+            logger.warning(f"Unknown type for {table_name}.{col_name}: {source_type}. Using VARCHAR({DEFAULT_VARCHAR_SIZE}).")
+            type_mapping[col_name] = VARCHAR(DEFAULT_VARCHAR_SIZE)
+    
+    return type_mapping
+
+def extract_table_data_in_chunks(table_name, source_schema=None, worker_id=0):
+    """Extract data from source table in chunks and return a generator"""
+    source_engine = get_connection('source', worker_id)
+    qualified_table = get_qualified_table_name(table_name, source_schema)
+    
+    # First, get row count for better progress tracking
+    count_query = f"SELECT COUNT(*) AS row_count FROM {qualified_table}"
+    try:
+        row_count = pd.read_sql(count_query, source_engine).iloc[0]['row_count']
+        logger.info(f"Table {qualified_table} has {row_count:,} rows to extract")
+    except Exception as e:
+        logger.warning(f"Could not get row count for {qualified_table}: {str(e)}")
+        row_count = 0
+    
+    # Now extract in chunks
+    query = f"SELECT * FROM {qualified_table}"
+    
+    try:
+        # Define chunk query function for parallel execution
+        def get_chunk(offset, limit):
+            chunk_query = f"{query} LIMIT {limit} OFFSET {offset}"
+            chunk_engine = get_connection('source', worker_id)
+            chunk_df = pd.read_sql(chunk_query, chunk_engine)
+            logger.debug(f"Extracted chunk {offset}-{offset+len(chunk_df)} from {qualified_table}")
+            return chunk_df
+        
+        # Determine number of chunks
+        if row_count > 0:
+            num_chunks = (row_count // CHUNK_SIZE) + (1 if row_count % CHUNK_SIZE > 0 else 0)
+        else:
+            # Just try to get some data if we don't know the row count
+            num_chunks = 10
+        
+        # Return a generator that will yield each chunk
+        for i in range(num_chunks):
+            offset = i * CHUNK_SIZE
+            # Use a separate process to get each chunk
+            yield get_chunk(offset, CHUNK_SIZE)
+            
+    except Exception as e:
+        logger.error(f"Error extracting data from {qualified_table}: {str(e)}")
+        raise
+
+def prepare_target_table(table_name, source_schema_info, worker_id=0):
+    """Prepare the target table with correct schema"""
+    target_engine = get_connection('target', worker_id)
+    qualified_table = get_qualified_table_name(table_name, TARGET_SCHEMA)
+    
+    try:
+        # Map data types
+        column_types = map_data_types(source_schema_info, table_name)
+        
+        # Add load_date column
+        column_types['load_date'] = VARCHAR(10)
+        
+        # Check if table exists
+        inspector = inspect(target_engine)
+        target_tables = inspector.get_table_names(schema=TARGET_SCHEMA)
+        
+        if table_name not in target_tables:
+            # Create the table
+            metadata = MetaData()
+            columns = [Column(col_name, col_type) for col_name, col_type in column_types.items()]
+            Table(table_name, metadata, *columns, schema=TARGET_SCHEMA)
+            metadata.create_all(target_engine)
+            logger.info(f"Created new table {qualified_table}")
+        else:
+            # Check for missing columns
+            existing_columns = {col['name']: col for col in inspector.get_columns(table_name, schema=TARGET_SCHEMA)}
+            missing_columns = set(column_types.keys()) - set(existing_columns.keys())
+            
+            if missing_columns:
+                for col_name in missing_columns:
+                    col_type = column_types[col_name]
+                    alter_stmt = f'ALTER TABLE {qualified_table} ADD COLUMN "{col_name}" {col_type}'
+                    target_engine.execute(text(alter_stmt))
+                    logger.info(f"Added column {col_name} to {qualified_table}")
+        
+        return column_types
+    
+    except Exception as e:
+        logger.error(f"Error preparing table {qualified_table}: {str(e)}")
+        raise
+
+def load_chunk_to_target(chunk_df, table_name, column_types, worker_id=0):
+    """Load a chunk of data to the target table"""
+    if chunk_df.empty:
+        return 0
+    
+    target_engine = get_connection('target', worker_id)
+    
+    try:
+        # Add load_date
+        today_str = date.today().strftime('%Y-%m-%d')
+        chunk_df['load_date'] = today_str
+        
+        # Upload to target - always append
+        chunk_df.to_sql(
+            name=table_name,
+            con=target_engine,
+            schema=TARGET_SCHEMA,
+            if_exists='append',
+            index=False,
+            dtype=column_types
+        )
+        
+        return len(chunk_df)
+    
+    except Exception as e:
+        logger.error(f"Error loading chunk to {table_name}: {str(e)}")
+        raise
+
+def process_table_data_parallel(chunks, table_name, column_types):
+    """Process multiple chunks in parallel and load to target"""
+    total_loaded = 0
+    total_chunks = 0
+    
+    with ThreadPoolExecutor(max_workers=CHUNK_WORKERS) as executor:
+        # Submit each chunk for loading
+        future_to_chunk = {}
+        
+        # Process chunks as they're generated
+        for i, chunk_df in enumerate(chunks):
+            # Skip empty chunks
+            if chunk_df.empty:
+                continue
+                
+            # Assign a worker ID for connection management
+            worker_id = i % CHUNK_WORKERS
+            
+            # Submit the chunk for processing - no filtering, just load
+            future = executor.submit(
+                load_chunk_to_target,
+                chunk_df, 
+                table_name, 
+                column_types,
+                worker_id
+            )
+            
+            future_to_chunk[future] = i
+            total_chunks += 1
+        
+        # Process results as they complete
+        for i, future in enumerate(as_completed(future_to_chunk)):
+            chunk_idx = future_to_chunk[future]
+            
+            try:
+                rows_loaded = future.result()
+                total_loaded += rows_loaded
+                
+                # Log progress periodically
+                if i % 5 == 0 or i == total_chunks - 1:
+                    progress = (i + 1) / total_chunks * 100
+                    logger.info(f"Table {table_name} progress: {progress:.1f}% ({i+1}/{total_chunks} chunks, {total_loaded:,} rows loaded)")
+                    
+            except Exception as e:
+                logger.error(f"Error in chunk {chunk_idx} for {table_name}: {str(e)}")
+    
+    return total_loaded
+
+def migrate_table(table_name, worker_id=0):
+    """Migrate a single table from source to target"""
+    start_time = datetime.datetime.now()
+    logger.info(f"Starting migration for table {table_name} (worker {worker_id})")
+    
+    try:
+        # Get source schema name
+        source_schema = SOURCE_DB_CONFIG.get('schema')
+        
+        # Get connections
+        source_engine = get_connection('source', worker_id)
+        
+        # Get source table schema
+        source_schema_info = get_table_schema(source_engine, table_name, schema=source_schema)
+        if not source_schema_info:
+            return {
+                "table": table_name,
+                "status": "error",
+                "message": "Could not retrieve schema"
+            }
+        
+        # Prepare target table
+        column_types = prepare_target_table(table_name, source_schema_info, worker_id)
+        
+        # Create a generator for chunks
+        chunks = extract_table_data_in_chunks(table_name, source_schema, worker_id)
+        
+        # Process all chunks in parallel - no duplicate filtering
+        total_loaded = process_table_data_parallel(chunks, table_name, column_types)
+        
+        duration = (datetime.datetime.now() - start_time).total_seconds()
+        
+        return {
+            "table": table_name,
+            "status": "success",
+            "rows_loaded": total_loaded,
+            "duration_seconds": duration
+        }
+    
+    except Exception as e:
+        duration = (datetime.datetime.now() - start_time).total_seconds()
+        logger.error(f"Error migrating table {table_name}: {str(e)}")
+        
+        return {
+            "table": table_name,
+            "status": "error",
+            "message": str(e),
+            "duration_seconds": duration
+        }
+
+def migrate_all_tables_parallel():
+    """Migrate all tables in parallel"""
+    start_time = datetime.datetime.now()
+    today = date.today().strftime('%Y-%m-%d')
+    logger.info(f"Starting parallel migration of {len(TABLES_TO_MIGRATE)} tables on {today}")
+    
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=TABLE_WORKERS) as executor:
+        # Submit each table for migration
+        future_to_table = {}
+        
+        for i, table_name in enumerate(TABLES_TO_MIGRATE):
+            # Assign each table its own worker ID
+            worker_id = i % TABLE_WORKERS
+            future = executor.submit(migrate_table, table_name, worker_id)
+            future_to_table[future] = table_name
+        
+        # Process results as they complete
+        for future in as_completed(future_to_table):
+            table_name = future_to_table[future]
+            
+            try:
+                result = future.result()
+                results.append(result)
+                
+                # Log the result
+                if result["status"] == "success":
+                    logger.info(f"✓ Table {table_name} migration completed: {result.get('rows_loaded', 0):,} rows loaded in {result.get('duration_seconds', 0):.1f} seconds")
+                else:
+                    logger.error(f"✗ Table {table_name} migration failed: {result.get('message', 'Unknown error')}")
+                
+            except Exception as e:
+                logger.error(f"Error in migration of {table_name}: {str(e)}")
+                results.append({
+                    "table": table_name,
+                    "status": "error",
+                    "message": str(e)
+                })
+    
+    total_duration = (datetime.datetime.now() - start_time).total_seconds()
+    logger.info(f"All migrations completed in {total_duration:.1f} seconds")
+    
+    return results
+
+def log_migration_summary(results):
+    """Log a summary of the migration results"""
+    successful = [r for r in results if r["status"] == "success"]
+    failed = [r for r in results if r["status"] == "error"]
+    
+    # Calculate totals
+    total_rows = sum(r.get('rows_loaded', 0) for r in successful)
+    total_duration = sum(r.get('duration_seconds', 0) for r in results)
+    
+    # Log summary
+    logger.info("=" * 80)
+    logger.info("MIGRATION SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Total tables: {len(results)}")
+    logger.info(f"Successful: {len(successful)}")
+    logger.info(f"Failed: {len(failed)}")
+    logger.info(f"Total rows loaded: {total_rows:,}")
+    logger.info(f"Total duration: {total_duration:.1f} seconds")
+    logger.info("=" * 80)
+    
+    # Log table details
+    logger.info(f"{'TABLE':<20} {'STATUS':<10} {'ROWS':<10} {'DURATION':<10} {'DETAILS'}")
+    logger.info("-" * 80)
+    
+    for result in sorted(results, key=lambda r: r['table']):
+        table = result['table']
+        status = result['status']
+        rows = f"{result.get('rows_loaded', 0):,}" if status == 'success' else "-"
+        duration = f"{result.get('duration_seconds', 0):.1f}s" if 'duration_seconds' in result else "-"
+        details = result.get('message', '') if status == 'error' else ''
+        
+        logger.info(f"{table:<20} {status:<10} {rows:<10} {duration:<10} {details}")
+    
+    logger.info("=" * 80)
+    
+    # Save results to file
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"migration_results_{timestamp}.json"
+    
+    with open(filename, 'w') as f:
+        json.dump({
+            "summary": {
+                "timestamp": timestamp,
+                "total_tables": len(results),
+                "successful": len(successful),
+                "failed": len(failed),
+                "total_rows_loaded": total_rows,
+                "total_duration_seconds": total_duration
+            },
+            "tables": results
+        }, f, indent=2)
+    
+    logger.info(f"Results saved to {filename}")
+    
+    return len(failed) == 0
+
+def main():
+    """Main entry point for the script"""
+    try:
+        logger.info("=" * 80)
+        logger.info("REDSHIFT PARALLEL MIGRATION - APPEND ALL ROWS")
+        logger.info("=" * 80)
+        logger.info(f"Source: {SOURCE_DB_CONFIG['host']}:{SOURCE_DB_CONFIG['port']}/{SOURCE_DB_CONFIG['database']}/{SOURCE_DB_CONFIG.get('schema')}")
+        logger.info(f"Target: {TARGET_DB_CONFIG['host']}:{TARGET_DB_CONFIG['port']}/{TARGET_DB_CONFIG['database']}/{TARGET_SCHEMA}")
+        logger.info(f"Tables: {', '.join(TABLES_TO_MIGRATE)}")
+        logger.info(f"Table workers: {TABLE_WORKERS}, Chunk workers: {CHUNK_WORKERS}")
+        logger.info("=" * 80)
+        
+        # Run the migration
+        results = migrate_all_tables_parallel()
+        
+        # Log summary
+        success = log_migration_summary(results)
+        
+        # Cleanup connections
+        for pool_type in connection_pools:
+            for engine in connection_pools[pool_type].values():
+                engine.dispose()
+        
+        if success:
+            logger.info("Migration completed successfully!")
+            return 0
+        else:
+            logger.error("Migration completed with errors. See log for details.")
+            return 1
+    
+    except Exception as e:
+        logger.critical(f"Migration failed: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
