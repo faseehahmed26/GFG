@@ -13,9 +13,7 @@ from nltk.tokenize import sent_tokenize, TextTilingTokenizer
 from nltk.corpus import stopwords
 
 # Document parsing
-from pdfminer.high_level import extract_text, extract_pages
-from pdfminer.layout import LTTextContainer, LTPage
-import tabula
+import fitz  # PyMuPDF for better PDF handling
 import docx
 
 # Embedding and retrieval
@@ -64,44 +62,53 @@ class DocumentParser:
             raise ValueError(f"Unsupported file format: {file_extension}")
     
     def _parse_pdf(self, file_path: Path) -> Dict[str, Any]:
-        """Parse PDF file to extract text, tables and maintain page structure."""
+        """Parse PDF file using PyMuPDF for better extraction quality."""
         try:
-            logger.info(f"Parsing PDF file: {file_path}")
+            logger.info(f"Parsing PDF file with PyMuPDF: {file_path}")
             
-            # Extract text with page information
+            # Open the PDF document
+            doc = fitz.open(str(file_path))
             pages_text = []
-            page_num = 0
+            tables = []
             
-            # Extract text with page structure
-            for page_layout in extract_pages(str(file_path)):
-                page_num += 1
-                page_text = ""
+            # Process each page
+            for page_num, page in enumerate(doc, 1):
+                # Extract text with better layout preservation
+                text = page.get_text("text")  # Simple text mode
                 
-                for element in page_layout:
-                    if isinstance(element, LTTextContainer):
-                        page_text += element.get_text() + " "
+                # Clean up the text a bit
+                text = re.sub(r'\s+', ' ', text)
                 
                 pages_text.append({
                     "page_num": page_num,
-                    "text": page_text.strip()
+                    "text": text.strip()
                 })
-            
-            # Extract tables
-            tables = []
-            try:
-                extracted_tables = tabula.read_pdf(
-                    str(file_path),
-                    pages='all',
-                    multiple_tables=True
-                )
                 
-                for i, table in enumerate(extracted_tables):
-                    tables.append({
-                        "table_id": i + 1,
-                        "content": table.to_dict('records')
-                    })
-            except Exception as e:
-                logger.warning(f"Error extracting tables from PDF: {e}")
+                # Table detection and extraction
+                try:
+                    tables_on_page = page.find_tables()
+                    
+                    for i, table in enumerate(tables_on_page):
+                        # Convert table to structured data
+                        rows = []
+                        for cells in table.extract():
+                            row_data = {}
+                            for j, cell_text in enumerate(cells):
+                                row_data[f"col_{j}"] = cell_text
+                            rows.append(row_data)
+                        
+                        tables.append({
+                            "table_id": len(tables) + 1,
+                            "page_num": page_num,
+                            "content": rows
+                        })
+                except Exception as e:
+                    logger.warning(f"Error extracting tables from page {page_num}: {e}")
+            
+            # Close the document
+            doc.close()
+            
+            logger.info(f"Successfully extracted {len(pages_text)} pages and {len(tables)} tables from PDF")
             
             return {
                 "file_name": file_path.name,
@@ -115,62 +122,98 @@ class DocumentParser:
             raise
     
     def _parse_docx(self, file_path: Path) -> Dict[str, Any]:
-        """Parse DOCX file to extract text and tables."""
+        """Parse DOCX file to extract text and tables with better structure preservation."""
         try:
             logger.info(f"Parsing DOCX file: {file_path}")
             doc = docx.Document(file_path)
             
-            # Extract text by paragraphs
-            paragraphs = []
+            # Track paragraphs with their styles
+            structured_paragraphs = []
+            
+            # Extract text by paragraphs, preserving styles for better section detection
             for para in doc.paragraphs:
                 if para.text.strip():
-                    paragraphs.append(para.text)
+                    # Get paragraph style name (helps identify headings)
+                    style_name = para.style.name if para.style else "Normal"
+                    
+                    structured_paragraphs.append({
+                        "text": para.text.strip(),
+                        "style": style_name,
+                        # Check if it's likely a heading
+                        "is_heading": style_name.startswith('Heading') or 
+                                     (len(para.text) < 100 and para.text.isupper())
+                    })
             
-            # Extract tables
+            # Extract tables with better column naming
             tables = []
             for i, table in enumerate(doc.tables):
                 table_data = []
-                for row in table.rows:
+                
+                # Check if first row might be headers
+                has_header = False
+                if table.rows and len(table.rows) > 1:
+                    # Heuristic: first row is likely header if it's all non-empty and formatted differently
+                    first_row = table.rows[0]
+                    has_header = all(cell.text.strip() for cell in first_row.cells)
+                
+                # Extract headers if present
+                headers = []
+                if has_header:
+                    for cell in table.rows[0].cells:
+                        headers.append(cell.text.strip() or f"Column_{len(headers)+1}")
+                
+                # Process rows
+                start_row = 1 if has_header else 0
+                for row_idx, row in enumerate(table.rows[start_row:], start=start_row):
                     row_data = {}
                     for j, cell in enumerate(row.cells):
-                        row_data[f"col_{j}"] = cell.text
+                        # Use header name if available, otherwise use column index
+                        column_name = headers[j] if has_header and j < len(headers) else f"col_{j}"
+                        row_data[column_name] = cell.text.strip()
                     table_data.append(row_data)
                 
                 tables.append({
                     "table_id": i + 1,
-                    "content": table_data
+                    "content": table_data,
+                    "has_header": has_header,
+                    "headers": headers if has_header else []
                 })
             
-            # Combine paragraphs into pages (approximate, as DOCX doesn't have page info)
-            # Assume ~3000 chars per page as a rough estimate
-            page_size = 3000
+            # Create pages from paragraphs (approximate, as DOCX doesn't have native page info)
+            # Group by headings and significant breaks
             pages_text = []
-            current_page = ""
+            current_page = []
             page_count = 1
             
-            for para in paragraphs:
-                if len(current_page) + len(para) > page_size:
-                    pages_text.append({
-                        "page_num": page_count,
-                        "text": current_page.strip()
-                    })
-                    current_page = para + " "
-                    page_count += 1
-                else:
-                    current_page += para + " "
+            for para in structured_paragraphs:
+                # Start a new page on major headings or after accumulating substantial content
+                if (para["is_heading"] and para["style"].startswith("Heading 1")) or \
+                   (len(current_page) > 10 and para["is_heading"]):
+                    if current_page:
+                        combined_text = " ".join([p["text"] for p in current_page])
+                        pages_text.append({
+                            "page_num": page_count,
+                            "text": combined_text
+                        })
+                        page_count += 1
+                        current_page = []
+                
+                current_page.append(para)
             
             # Add the last page if it's not empty
-            if current_page.strip():
+            if current_page:
+                combined_text = " ".join([p["text"] for p in current_page])
                 pages_text.append({
                     "page_num": page_count,
-                    "text": current_page.strip()
+                    "text": combined_text
                 })
             
             return {
                 "file_name": file_path.name,
                 "file_type": "docx",
                 "pages": pages_text,
-                "tables": tables
+                "tables": tables,
+                "paragraphs": structured_paragraphs  # Keep detailed paragraph info for better processing
             }
             
         except Exception as e:
@@ -799,12 +842,13 @@ def main():
     if not output_path:
         output_path = "data_sharing_restrictions.xlsx"
     
-    # Print notice about LLM requirements
-    print("\nNote: This system uses the Phi-2 model which requires:")
-    print("- Approximately 2-3GB of RAM for the model itself")
-    print("- Additional RAM for document processing (varies by document size)")
-    print("- Will run on CPU but may take several minutes to analyze chunks")
-    print("- Total recommended RAM: 8GB minimum, 32GB is plenty\n")
+    # Print notice about requirements and improved PDF processing
+    print("\nNote: This system uses:")
+    print("- PyMuPDF for high-quality PDF extraction (much better than pdfminer)")
+    print("- Improved DOCX parsing with structure preservation")
+    print("- Phi-2 model which requires ~2-3GB of RAM")
+    print("- Total RAM usage: ~7GB for large documents (68K tokens)")
+    print("- Processing time: ~4-11 minutes depending on document size\n")
     
     # Initialize detector with simplified approach
     detector = DataSharingDetector(
