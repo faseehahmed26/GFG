@@ -1,291 +1,1442 @@
 import os
 import re
+import json
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-import fitz  # PyMuPDF
-import docx
+from typing import List, Dict, Tuple, Any, Optional
+from pathlib import Path
+import logging
 import time
+from tqdm import tqdm
+import nltk
+from nltk.tokenize import sent_tokenize, TextTilingTokenizer
+from nltk.corpus import stopwords
+
+# Document parsing
+from pdfminer.high_level import extract_text, extract_pages
+from pdfminer.layout import LTTextContainer, LTPage
+import tabula
+import docx
+
+# Embedding and retrieval
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+import faiss
 
-# Constants
-SIMILARITY_THRESHOLD = 0.65  # Threshold for determining restrictions
+# LLM for analysis
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
-print("Starting document analysis script...")
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('DataSharingAnalyzer')
 
-# 1. Document parsing functions - keeping this simple and efficient
-def extract_text_from_pdf(pdf_path):
-    """Extract text from PDF file."""
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        doc.close()
-        return text
-    except Exception as e:
-        print(f"Error extracting text from PDF {pdf_path}: {e}")
-        return ""
-
-def extract_text_from_docx(docx_path):
-    """Extract text from DOCX file."""
-    try:
-        doc = docx.Document(docx_path)
-        text = ""
-        for para in doc.paragraphs:
-            text += para.text + "\n"
-        doc.close()
-        return text
-    except Exception as e:
-        print(f"Error extracting text from DOCX {docx_path}: {e}")
-        return ""
-
-def extract_text_from_file(file_path):
-    """Extract text from file based on extension."""
-    ext = os.path.splitext(file_path)[1].lower()
+class DocumentParser:
+    """Handles parsing of PDF and DOC/DOCX files to extract text and tables."""
     
-    if ext == '.pdf':
-        return extract_text_from_pdf(file_path)
-    elif ext == '.docx':
-        return extract_text_from_docx(file_path)
-    else:
-        print(f"Unsupported file format: {ext}")
-        return ""
-
-def split_into_paragraphs(text):
-    """Split text into paragraphs, handling various document formats."""
-    # Split by various paragraph markers
-    paragraphs = []
+    def __init__(self):
+        logger.info("Initializing document parser...")
     
-    # First try splitting by double newlines (most common paragraph separator)
-    initial_paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    
-    # Process each paragraph - further split if too long
-    for para in initial_paragraphs:
-        if len(para) > 1000:  # If paragraph is very long
-            # Split by single newlines
-            subparas = [sp.strip() for sp in para.split('\n') if sp.strip()]
-            paragraphs.extend(subparas)
+    def parse_document(self, file_path: str) -> Dict[str, Any]:
+        """
+        Parse document based on file extension and extract content
+        
+        Args:
+            file_path: Path to the document file
+            
+        Returns:
+            Dictionary containing extracted text, tables, and metadata
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        file_extension = file_path.suffix.lower()
+        
+        if file_extension == '.pdf':
+            return self._parse_pdf(file_path)
+        elif file_extension in ['.doc', '.docx']:
+            return self._parse_docx(file_path)
         else:
-            paragraphs.append(para)
+            raise ValueError(f"Unsupported file format: {file_extension}")
     
-    return paragraphs
-
-# 2. Keyword-based filtering for efficient candidate selection
-def restriction_keyword_filter(paragraph):
-    """
-    Check if paragraph likely contains data sharing restrictions.
-    This is a fast pre-filter to identify candidate paragraphs.
-    """
-    # Keywords specifically related to data sharing restrictions
-    # Focusing on legal/clinical trial terminology
-    restriction_keywords = [
-        'not allowed', 'not permit', 'prohibit', 'restrict', 'forbidden',
-        'confidential', 'proprietary', 'not share', 'not be shared',
-        'shall not', 'must not', 'cannot be', 'not authorized',
-        'exclusive', 'solely', 'only for', 'limited to', 
-        'not to be used', 'not for', 'may not be', 'not available'
-    ]
-    
-    # Data-related keywords
-    data_keywords = [
-        'data', 'information', 'dataset', 'record', 'result',
-        'trial', 'study', 'research', 'finding', 'patient'
-    ]
-    
-    # First, check if paragraph contains any data-related terms
-    has_data_term = any(term in paragraph.lower() for term in data_keywords)
-    if not has_data_term:
-        return False
-    
-    # Then check for restriction terms
-    has_restriction_term = any(term in paragraph.lower() for term in restriction_keywords)
-    
-    return has_restriction_term
-
-# 3. Embedding model for semantic similarity
-def load_embedding_model():
-    """Load the most appropriate embedding model for legal/clinical text."""
-    print("Loading embedding model...")
-    try:
-        # Use a model that works well with legal text while still being efficient
-        # MPNet is a good compromise between performance and efficiency
-        model = SentenceTransformer('all-mpnet-base-v2')
-        return model
-    except Exception as e:
-        print(f"Error loading MPNet model: {e}")
+    def _parse_pdf(self, file_path: Path) -> Dict[str, Any]:
+        """Parse PDF file to extract text, tables and maintain page structure."""
         try:
-            # Fall back to lighter model if needed
-            print("Falling back to MiniLM model...")
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            return model
-        except Exception as e2:
-            print(f"Error loading fallback model: {e2}")
-            return None
+            logger.info(f"Parsing PDF file: {file_path}")
+            
+            # Extract text with page information
+            pages_text = []
+            page_num = 0
+            
+            # Extract text with page structure
+            for page_layout in extract_pages(str(file_path)):
+                page_num += 1
+                page_text = ""
+                
+                for element in page_layout:
+                    if isinstance(element, LTTextContainer):
+                        page_text += element.get_text() + " "
+                
+                pages_text.append({
+                    "page_num": page_num,
+                    "text": page_text.strip()
+                })
+            
+            # Extract tables
+            tables = []
+            try:
+                extracted_tables = tabula.read_pdf(
+                    str(file_path),
+                    pages='all',
+                    multiple_tables=True
+                )
+                
+                for i, table in enumerate(extracted_tables):
+                    tables.append({
+                        "table_id": i + 1,
+                        "content": table.to_dict('records')
+                    })
+            except Exception as e:
+                logger.warning(f"Error extracting tables from PDF: {e}")
+            
+            return {
+                "file_name": file_path.name,
+                "file_type": "pdf",
+                "pages": pages_text,
+                "tables": tables
+            }
+            
+        except Exception as e:
+            logger.error(f"Error parsing PDF file {file_path}: {e}")
+            raise
+    
+    def _parse_docx(self, file_path: Path) -> Dict[str, Any]:
+        """Parse DOCX file to extract text and tables."""
+        try:
+            logger.info(f"Parsing DOCX file: {file_path}")
+            doc = docx.Document(file_path)
+            
+            # Extract text by paragraphs
+            paragraphs = []
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    paragraphs.append(para.text)
+            
+            # Extract tables
+            tables = []
+            for i, table in enumerate(doc.tables):
+                table_data = []
+                for row in table.rows:
+                    row_data = {}
+                    for j, cell in enumerate(row.cells):
+                        row_data[f"col_{j}"] = cell.text
+                    table_data.append(row_data)
+                
+                tables.append({
+                    "table_id": i + 1,
+                    "content": table_data
+                })
+            
+            # Combine paragraphs into pages (approximate, as DOCX doesn't have page info)
+            # Assume ~3000 chars per page as a rough estimate
+            page_size = 3000
+            pages_text = []
+            current_page = ""
+            page_count = 1
+            
+            for para in paragraphs:
+                if len(current_page) + len(para) > page_size:
+                    pages_text.append({
+                        "page_num": page_count,
+                        "text": current_page.strip()
+                    })
+                    current_page = para + " "
+                    page_count += 1
+                else:
+                    current_page += para + " "
+            
+            # Add the last page if it's not empty
+            if current_page.strip():
+                pages_text.append({
+                    "page_num": page_count,
+                    "text": current_page.strip()
+                })
+            
+            return {
+                "file_name": file_path.name,
+                "file_type": "docx",
+                "pages": pages_text,
+                "tables": tables
+            }
+            
+        except Exception as e:
+            logger.error(f"Error parsing DOCX file {file_path}: {e}")
+            raise
 
-# 4. Define clear restriction templates for comparison
-def get_restriction_templates():
-    """
-    Define clear templates of data sharing restrictions.
-    These are the definitive examples we'll compare against.
-    """
-    return [
-        # Explicit prohibition statements
-        "Data from this study cannot be shared for other research purposes.",
-        "Sharing of this data for secondary research is not permitted.",
-        "The study data may not be used for any other research initiatives.",
-        "This clinical trial data shall not be shared with external researchers.",
-        "It is prohibited to use this data for secondary analyses.",
-        "Patient data from this trial is not to be shared for other purposes.",
-        "Data sharing for secondary research is not allowed under this protocol.",
-        "The data is restricted to this study only and cannot be reused.",
-        "Research data must not be distributed for other studies.",
-        "Information collected in this trial is not available for other uses.",
+class TextProcessor:
+    """Processes extracted text and splits it into manageable chunks."""
+    
+    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 100):
+        """
+        Initialize the text processor
         
-        # Legal/ICF specific language
-        "The data is proprietary and confidential and shall not be shared.",
-        "All study information is exclusively for the purposes described herein.",
-        "Patient records are confidential and not for secondary use.",
-        "This data belongs exclusively to the sponsor and cannot be repurposed.",
-        "Trial data is protected by confidentiality obligations and not for sharing."
-    ]
-
-# 5. Core analysis function
-def analyze_for_data_sharing_restrictions(file_path, output_file):
-    """
-    Analyze a document to find data sharing restrictions using a simple, efficient approach.
-    Default assumption: data sharing is allowed unless we find clear evidence otherwise.
-    """
-    print(f"\nAnalyzing {os.path.basename(file_path)} for data sharing restrictions...")
-    start_time = time.time()
+        Args:
+            chunk_size: Target size of text chunks in characters
+            chunk_overlap: Number of characters to overlap between chunks
+        """
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        logger.info(f"Initializing text processor with chunk size {chunk_size} and overlap {chunk_overlap}")
     
-    # Extract text
-    text = extract_text_from_file(file_path)
-    if not text:
-        print(f"Failed to extract text from {file_path}")
-        return "ERROR", []
-    
-    # Split into paragraphs
-    paragraphs = split_into_paragraphs(text)
-    total_paragraphs = len(paragraphs)
-    print(f"Document contains {total_paragraphs} paragraphs")
-    
-    # Filter candidate paragraphs using keywords (fast pre-filtering)
-    candidates = []
-    for para in paragraphs:
-        if restriction_keyword_filter(para):
-            candidates.append(para)
-    
-    print(f"Identified {len(candidates)} candidate paragraphs for detailed analysis")
-    if len(candidates) == 0:
-        print("No relevant paragraphs found - data sharing appears to be allowed")
+    def process_document(self, doc_content: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Process document content and split into chunks
         
-        # Save empty results
-        pd.DataFrame({
-            'filename': [os.path.basename(file_path)],
-            'document_status': ['ALLOWED'],
-            'rationale': ['No data sharing restrictions found'],
-            'paragraph': ['N/A'],
-            'similarity_score': [0]
-        }).to_excel(output_file, index=False)
+        Args:
+            doc_content: Document content from parser
+            
+        Returns:
+            List of chunks with metadata
+        """
+        logger.info("Processing document text and creating chunks...")
+        chunks = []
         
-        return "ALLOWED", []
-    
-    # Load embedding model
-    model = load_embedding_model()
-    if model is None:
-        print("Failed to load embedding model")
-        return "ERROR", []
-    
-    # Get restriction templates
-    templates = get_restriction_templates()
-    template_embeddings = model.encode(templates)
-    
-    # Process each candidate paragraph
-    restriction_findings = []
-    for para in tqdm(candidates, desc="Analyzing candidates"):
-        # Get paragraph embedding
-        para_embedding = model.encode([para])[0]
+        # Process text from pages
+        for page in doc_content["pages"]:
+            page_num = page["page_num"]
+            text = page["text"]
+            
+            # Clean text
+            cleaned_text = self._clean_text(text)
+            
+            # Split into paragraphs first
+            paragraphs = self._split_into_paragraphs(cleaned_text)
+            
+            # Create chunks from paragraphs
+            page_chunks = self._create_chunks_from_paragraphs(
+                paragraphs, 
+                page_num
+            )
+            
+            chunks.extend(page_chunks)
         
-        # Calculate similarity to each template
-        similarities = cosine_similarity([para_embedding], template_embeddings)[0]
-        
-        # Get maximum similarity score
-        max_similarity = np.max(similarities)
-        max_index = np.argmax(similarities)
-        
-        # If similarity exceeds threshold, consider it a restriction
-        if max_similarity >= SIMILARITY_THRESHOLD:
-            restriction_findings.append({
-                'paragraph': para,
-                'similarity_score': max_similarity,
-                'matched_template': templates[max_index]
+        # Add tables as chunks
+        for table in doc_content["tables"]:
+            table_id = table["table_id"]
+            table_text = self._table_to_text(table["content"])
+            
+            chunks.append({
+                "chunk_id": f"table_{table_id}",
+                "text": table_text,
+                "page_num": "Unknown",  # Tables in PDFs don't always have page info
+                "source": "table",
+                "is_table": True,
+                "context": table_text[:200] + "..." if len(table_text) > 200 else table_text
             })
-    
-    # Make determination
-    if restriction_findings:
-        status = "RESTRICTED"
-        print(f"\n⚠️ ALERT: DATA SHARING IS RESTRICTED ⚠️")
-        print(f"Found {len(restriction_findings)} paragraphs indicating data sharing restrictions")
         
-        # Show top 3 restriction findings
-        print("\nKey restriction paragraphs:")
-        for i, finding in enumerate(sorted(restriction_findings, 
-                                          key=lambda x: x['similarity_score'], 
-                                          reverse=True)[:3]):
-            print(f"{i+1}. Score: {finding['similarity_score']:.2f} - {finding['paragraph'][:150]}...")
-    else:
-        status = "ALLOWED"
-        print("\n✅ No data sharing restrictions found - data sharing appears to be ALLOWED")
+        logger.info(f"Created {len(chunks)} chunks from document")
+        return chunks
+    
+    def _clean_text(self, text: str) -> str:
+        """Clean extracted text by removing artifacts and normalizing whitespace."""
+        # Replace multiple whitespace with single space
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove common header/footer patterns
+        text = re.sub(r'Page \d+ of \d+', '', text)
+        
+        # Remove unnecessary Unicode characters
+        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
+        
+        return text.strip()
+    
+    def _split_into_paragraphs(self, text: str) -> List[str]:
+        """Split text into paragraphs using NLTK and semantic breaks."""
+        # Make sure NLTK data is downloaded
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            logger.info("Downloading NLTK punkt tokenizer data...")
+            nltk.download('punkt', quiet=True)
+        
+        try:
+            nltk.data.find('corpora/stopwords')
+        except LookupError:
+            logger.info("Downloading NLTK stopwords data...")
+            nltk.download('stopwords', quiet=True)
+            
+        # First split by obvious paragraph breaks (double newlines)
+        initial_paragraphs = re.split(r'\n\s*\n', text)
+        result = []
+        
+        for para in initial_paragraphs:
+            # Skip very short segments
+            if len(para.strip()) < 20:
+                if para.strip():
+                    result.append(para.strip())
+                continue
+                
+            # Use NLTK sentence tokenization
+            sentences = sent_tokenize(para)
+            
+            # Group sentences into semantic paragraphs
+            if len(sentences) > 5:
+                # For longer text, use TextTiling to find topic boundaries
+                try:
+                    tt = TextTilingTokenizer()
+                    segments = tt.tokenize(para)
+                    for segment in segments:
+                        if segment.strip():
+                            result.append(segment.strip())
+                except Exception as e:
+                    # Fall back to simpler method if TextTiling fails
+                    logger.warning(f"TextTiling failed: {e}. Using sentence grouping instead.")
+                    current_group = []
+                    for sentence in sentences:
+                        current_group.append(sentence)
+                        # Start a new paragraph after sentences that end with certain punctuation
+                        # or when we have 3-4 sentences
+                        if (re.search(r'[.!?:]\s*
+    
+    def _create_chunks_from_paragraphs(self, paragraphs: List[str], page_num: int) -> List[Dict[str, Any]]:
+        """Create overlapping chunks from paragraphs."""
+        chunks = []
+        current_chunk = ""
+        current_paragraphs = []
+        chunk_id = 1
+        
+        for para in paragraphs:
+            # If adding this paragraph exceeds chunk size, save current chunk and start new one
+            if len(current_chunk) + len(para) > self.chunk_size and current_chunk:
+                chunk_text = current_chunk.strip()
+                
+                # Get context (first and last paragraph)
+                context = (current_paragraphs[0][:100] + "..." if len(current_paragraphs[0]) > 100 else current_paragraphs[0])
+                if len(current_paragraphs) > 1:
+                    context += " [...] " + (current_paragraphs[-1][:100] + "..." if len(current_paragraphs[-1]) > 100 else current_paragraphs[-1])
+                
+                chunks.append({
+                    "chunk_id": f"page_{page_num}_chunk_{chunk_id}",
+                    "text": chunk_text,
+                    "page_num": page_num,
+                    "source": "text",
+                    "is_table": False,
+                    "context": context
+                })
+                
+                # Start new chunk with overlap
+                overlap_point = max(0, len(current_chunk) - self.chunk_overlap)
+                current_chunk = current_chunk[overlap_point:] + " " + para
+                current_paragraphs = [current_paragraphs[-1], para] if current_paragraphs else [para]
+                chunk_id += 1
+            else:
+                current_chunk += " " + para
+                current_paragraphs.append(para)
+        
+        # Add the last chunk if not empty
+        if current_chunk.strip():
+            chunk_text = current_chunk.strip()
+            
+            # Get context (first and last paragraph)
+            context = (current_paragraphs[0][:100] + "..." if len(current_paragraphs[0]) > 100 else current_paragraphs[0])
+            if len(current_paragraphs) > 1:
+                context += " [...] " + (current_paragraphs[-1][:100] + "..." if len(current_paragraphs[-1]) > 100 else current_paragraphs[-1])
+            
+            chunks.append({
+                "chunk_id": f"page_{page_num}_chunk_{chunk_id}",
+                "text": chunk_text,
+                "page_num": page_num,
+                "source": "text",
+                "is_table": False,
+                "context": context
+            })
+        
+        return chunks
+    
+    def _table_to_text(self, table_content: List[Dict[str, Any]]) -> str:
+        """Convert table dictionary to text representation."""
+        text = "TABLE CONTENT:\n"
+        
+        if not table_content:
+            return text + "Empty table"
+        
+        # Get all keys from the first row
+        keys = list(table_content[0].keys())
+        
+        # Create header
+        header = " | ".join(keys)
+        text += header + "\n"
+        text += "-" * len(header) + "\n"
+        
+        # Add rows
+        for row in table_content:
+            row_text = " | ".join(str(row.get(k, "")) for k in keys)
+            text += row_text + "\n"
+        
+        return text
+
+class EmbeddingGenerator:
+    """Generates embeddings for text chunks using a sentence transformer model."""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        """
+        Initialize the embedding generator with a lightweight model
+        
+        Args:
+            model_name: Name of the sentence-transformers model to use
+        """
+        logger.info(f"Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+        self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        logger.info(f"Embedding dimension: {self.embedding_dim}")
+    
+    def generate_embeddings(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Generate embeddings for all chunks
+        
+        Args:
+            chunks: List of text chunks
+            
+        Returns:
+            Chunks with added embedding vectors
+        """
+        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        
+        # Extract text from chunks
+        texts = [chunk["text"] for chunk in chunks]
+        
+        # Generate embeddings in batches to avoid memory issues
+        batch_size = 32
+        embeddings = []
+        
+        for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
+            batch_texts = texts[i:i+batch_size]
+            batch_embeddings = self.model.encode(batch_texts)
+            embeddings.extend(batch_embeddings)
+        
+        # Add embeddings to chunks
+        for i, chunk in enumerate(chunks):
+            chunk["embedding"] = embeddings[i]
+        
+        return chunks
+    
+    def generate_query_embeddings(self, queries: List[str]) -> np.ndarray:
+        """
+        Generate embeddings for search queries
+        
+        Args:
+            queries: List of query strings
+            
+        Returns:
+            Array of query embeddings
+        """
+        logger.info(f"Generating query embeddings for {len(queries)} queries")
+        query_embeddings = self.model.encode(queries)
+        return query_embeddings
+
+class RetrievalSystem:
+    """
+    Implements a vector retrieval system to find relevant chunks
+    related to data sharing restrictions.
+    """
+    
+    def __init__(self, embedding_dim: int):
+        """
+        Initialize the retrieval system
+        
+        Args:
+            embedding_dim: Dimension of the embeddings
+        """
+        logger.info(f"Initializing retrieval system with {embedding_dim} dimensions")
+        self.index = faiss.IndexFlatIP(embedding_dim)  # Inner product for cosine similarity
+        self.chunks = []
+    
+    def add_chunks(self, chunks: List[Dict[str, Any]]):
+        """
+        Add chunks to the retrieval index
+        
+        Args:
+            chunks: List of chunks with embeddings
+        """
+        embeddings = np.array([chunk["embedding"] for chunk in chunks]).astype(np.float32)
+        self.index.add(embeddings)
+        self.chunks = chunks
+        logger.info(f"Added {len(chunks)} chunks to retrieval index")
+    
+    def search(self, query_embeddings: np.ndarray, k: int = 10, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Search for relevant chunks using query embeddings
+        
+        Args:
+            query_embeddings: Embeddings of the search queries
+            k: Number of results to return per query
+            threshold: Minimum similarity score threshold
+            
+        Returns:
+            List of relevant chunks with similarity scores
+        """
+        logger.info(f"Searching for top {k} relevant chunks")
+        
+        # Ensure query_embeddings is 2D
+        if len(query_embeddings.shape) == 1:
+            query_embeddings = query_embeddings.reshape(1, -1)
+        
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(query_embeddings)
+        
+        # Search index
+        scores, indices = self.index.search(query_embeddings.astype(np.float32), k=k)
+        
+        # Collect results above threshold
+        results = []
+        seen_chunks = set()  # To avoid duplicates
+        
+        for query_idx, (query_scores, query_indices) in enumerate(zip(scores, indices)):
+            for score, idx in zip(query_scores, query_indices):
+                if idx < 0 or idx >= len(self.chunks):  # Skip invalid indices
+                    continue
+                    
+                if score < threshold:  # Skip results below threshold
+                    continue
+                
+                chunk = self.chunks[idx]
+                chunk_id = chunk["chunk_id"]
+                
+                if chunk_id in seen_chunks:  # Skip duplicates
+                    continue
+                
+                seen_chunks.add(chunk_id)
+                
+                results.append({
+                    **chunk,
+                    "similarity_score": float(score)
+                })
+        
+        # Sort by similarity score (descending)
+        results.sort(key=lambda x: x["similarity_score"], reverse=True)
+        
+        logger.info(f"Found {len(results)} relevant chunks above threshold {threshold}")
+        return results
+
+class DataSharingAnalyzer:
+    """
+    Analyzes retrieved chunks to identify data sharing restrictions
+    using only LLM analysis of top relevant chunks.
+    """
+    
+    def __init__(self):
+        """Initialize the LLM-based data sharing analyzer"""
+        logger.info("Initializing LLM-based data sharing analyzer")
+        
+        # Load the Microsoft Phi-2 model which is lightweight enough for CPU
+        logger.info("Loading Phi-2 model for analysis...")
+        try:
+            # Choose Phi-2 which is efficient for CPU usage
+            self.model_name = "microsoft/phi-2"
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            
+            # Load in 4-bit to reduce memory usage (essential for CPU)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                device_map="auto",  # Will use CPU by default if no GPU
+                load_in_4bit=True,  # Reduces memory footprint to ~2-3GB
+            )
+            logger.info("Phi-2 model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load LLM: {e}")
+            raise
+    
+    def analyze_chunks(self, relevant_chunks: List[Dict[str, Any]], max_chunks: int = 20) -> List[Dict[str, Any]]:
+        """
+        Analyze the top N most relevant chunks using the LLM
+        
+        Args:
+            relevant_chunks: List of relevant chunks from retrieval system
+            max_chunks: Maximum number of chunks to analyze with LLM
+            
+        Returns:
+            List of analyzed chunks with restriction details and confidence scores
+        """
+        # Limit to top chunks to avoid excessive processing time
+        top_chunks = relevant_chunks[:max_chunks]
+        logger.info(f"Analyzing top {len(top_chunks)} relevant chunks with Phi-2")
+        
+        results = []
+        
+        # Process each chunk with the LLM
+        for chunk in tqdm(top_chunks, desc="Analyzing with LLM"):
+            analysis = self._analyze_with_llm(chunk)
+            
+            if analysis["has_restrictions"]:
+                results.append({
+                    "paragraph": chunk["text"],
+                    "confidence": analysis["confidence"],
+                    "page": chunk["page_num"],
+                    "restriction_type": analysis["restriction_type"],
+                    "context": chunk["context"]
+                })
+        
+        # Sort by confidence (descending)
+        results.sort(key=lambda x: x["confidence"], reverse=True)
+        
+        logger.info(f"Found {len(results)} chunks with data sharing restrictions")
+        return results
+    
+    def _analyze_with_llm(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze a chunk using the Phi-2 LLM."""
+        try:
+            # Create a clear, focused prompt for the LLM
+            prompt = f"""
+            You are an expert in analyzing research documents for data sharing policies.
+            
+            Analyze the following text and determine if it contains restrictions against sharing data 
+            for secondary research, other clinical trials, or other research purposes.
+            
+            Text: {chunk['text']}
+            
+            Answer the following questions in JSON format:
+            1. has_restrictions: true if text contains ANY restriction on sharing data, false otherwise
+            2. restriction_type: One of "PROHIBITED" (complete ban), "CONDITIONAL" (allowed with conditions), or "NONE"
+            3. confidence: A number from 0-100 representing how confident you are in your assessment
+            
+            JSON:
+            """
+            
+            # Tokenize the prompt
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            
+            # Generate response with parameters optimized for factual accuracy
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=150,
+                    temperature=0.1,  # Low temperature for more deterministic output
+                    top_p=0.9,
+                    repetition_penalty=1.2,
+                    num_return_sequences=1,
+                )
+            
+            # Decode the response and extract the part after the prompt
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = response.replace(prompt, "").strip()
+            
+            # Extract JSON from the response using regex
+            json_match = re.search(r'(\{.*\})', response, re.DOTALL)
+            if json_match:
+                try:
+                    analysis = json.loads(json_match.group(1))
+                    return {
+                        "has_restrictions": analysis.get("has_restrictions", False),
+                        "restriction_type": analysis.get("restriction_type", "NONE"),
+                        "confidence": analysis.get("confidence", 0)
+                    }
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse JSON from LLM response")
+            
+            # If we couldn't extract valid JSON, use a conservative default
+            logger.warning("Could not extract valid JSON from LLM response, using default values")
+            return {
+                "has_restrictions": False,
+                "restriction_type": "NONE",
+                "confidence": 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in LLM analysis: {e}")
+            # Return conservative default values
+            return {
+                "has_restrictions": False,
+                "restriction_type": "NONE",
+                "confidence": 0
+            }
+
+class DataSharingDetector:
+    """
+    Main class that orchestrates the end-to-end process of detecting 
+    data sharing restrictions in documents using a simplified LLM-only approach.
+    """
+    
+    def __init__(
+        self,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+        search_threshold: float = 0.45,  # Slightly lower threshold to capture more potential matches
+        embedding_model: str = "all-MiniLM-L6-v2",
+        top_k: int = 20  # We'll analyze only the top 20 most relevant paragraphs
+    ):
+        """
+        Initialize the data sharing detector with simplified LLM-only approach
+        
+        Args:
+            chunk_size: Size of text chunks
+            chunk_overlap: Overlap between chunks
+            search_threshold: Similarity threshold for retrieval
+            embedding_model: Name of the embedding model to use
+            top_k: Number of top results to retrieve and analyze with LLM
+        """
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.search_threshold = search_threshold
+        self.embedding_model = embedding_model
+        self.top_k = top_k
+        
+        # More focused data sharing restriction queries specifically about not allowing secondary use
+        self.queries = [
+            "Data cannot be shared for secondary research or clinical trials",
+            "Data sharing for other clinical trials is prohibited",
+            "Restrictions on sharing data for future studies or secondary research",
+            "Data must not be used for purposes beyond this study",
+            "Secondary use of data is not permitted or is prohibited",
+            "Data is exclusively for the current research only, not for sharing",
+            "Sharing of this data for other research is forbidden",
+            "Data cannot be transferred to other researchers for different studies",
+            "Prohibition on using this data for other clinical trials",
+            "Data must not be repurposed for secondary analysis"
+        ]
+        
+        # Initialize components
+        self.parser = DocumentParser()
+        self.text_processor = TextProcessor(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self.embedding_generator = EmbeddingGenerator(model_name=embedding_model)
+        
+        # Retrieval system will be initialized after we know the embedding dimension
+        self.embedding_dim = self.embedding_generator.embedding_dim
+        self.retrieval_system = RetrievalSystem(self.embedding_dim)
+        
+        # LLM-based Analyzer 
+        self.analyzer = DataSharingAnalyzer()
+        
+        logger.info("Data sharing detector initialized successfully")
+    
+    def process_document(self, file_path: str) -> List[Dict[str, Any]]:
+        """
+        Process a document to detect data sharing restrictions
+        
+        Args:
+            file_path: Path to the document file
+            
+        Returns:
+            List of detected data sharing restrictions
+        """
+        try:
+            start_time = time.time()
+            logger.info(f"Processing document: {file_path}")
+            
+            # Step 1: Parse the document
+            doc_content = self.parser.parse_document(file_path)
+            logger.info(f"Document parsed: {len(doc_content['pages'])} pages, {len(doc_content['tables'])} tables")
+            
+            # Step 2: Process text and create chunks
+            chunks = self.text_processor.process_document(doc_content)
+            
+            # Step 3: Generate embeddings for chunks
+            chunks_with_embeddings = self.embedding_generator.generate_embeddings(chunks)
+            
+            # Step 4: Add chunks to retrieval system
+            self.retrieval_system.add_chunks(chunks_with_embeddings)
+            
+            # Step 5: Generate query embeddings
+            query_embeddings = self.embedding_generator.generate_query_embeddings(self.queries)
+            
+            # Step 6: Retrieve relevant chunks
+            relevant_chunks = self.retrieval_system.search(
+                query_embeddings,
+                k=self.top_k,
+                threshold=self.search_threshold
+            )
+            
+            # Step 7: Analyze chunks for data sharing restrictions
+            results = self.analyzer.analyze_chunks(relevant_chunks)
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Document processed in {elapsed_time:.2f} seconds")
+            logger.info(f"Found {len(results)} potential data sharing restrictions")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            raise
+    
+    def save_results_to_excel(self, results: List[Dict[str, Any]], output_path: str):
+        """
+        Save analysis results to Excel file
+        
+        Args:
+            results: List of detected data sharing restrictions
+            output_path: Path to save the Excel file
+        """
+        try:
+            logger.info(f"Saving results to Excel: {output_path}")
+            
+            # Create DataFrame from results
+            df = pd.DataFrame(results)
+            
+            # Format confidence as percentage
+            df["confidence"] = df["confidence"].apply(lambda x: f"{x:.1f}%")
+            
+            # Save to Excel
+            df.to_excel(output_path, index=False)
+            
+            logger.info(f"Results saved successfully: {len(results)} entries")
+            
+        except Exception as e:
+            logger.error(f"Error saving results to Excel: {e}")
+            raise
+
+def main():
+    """Main function to demonstrate usage."""
+    
+    # Get inputs from user
+    file_path = input("Enter path to document file: ")
+    output_path = input("Enter path to save results (Excel): ")
+    
+    # Set default output path if not provided
+    if not output_path:
+        output_path = "data_sharing_restrictions.xlsx"
+    
+    # Print notice about LLM requirements
+    print("\nNote: This system uses the Phi-2 model which requires:")
+    print("- Approximately 2-3GB of RAM for the model itself")
+    print("- Additional RAM for document processing (varies by document size)")
+    print("- Will run on CPU but may take several minutes to analyze chunks")
+    print("- Total recommended RAM: 8GB minimum, 32GB is plenty\n")
+    
+    # Initialize detector with simplified approach
+    detector = DataSharingDetector(
+        chunk_size=500,
+        chunk_overlap=100,
+        search_threshold=0.45,
+        top_k=20  # Will only analyze top 20 chunks with LLM
+    )
+    
+    # Process document
+    results = detector.process_document(file_path)
     
     # Save results to Excel
-    results = []
-    for finding in restriction_findings:
-        results.append({
-            'filename': os.path.basename(file_path),
-            'document_status': status,
-            'rationale': 'Found explicit data sharing restrictions' if status == 'RESTRICTED' else 'No restrictions found',
-            'paragraph': finding['paragraph'],
-            'similarity_score': round(finding['similarity_score'], 3),
-            'matched_template': finding['matched_template']
-        })
+    detector.save_results_to_excel(results, output_path)
     
-    # If no restrictions found, add a single summary row
-    if not results:
-        results.append({
-            'filename': os.path.basename(file_path),
-            'document_status': status,
-            'rationale': 'No data sharing restrictions found',
-            'paragraph': 'N/A',
-            'similarity_score': 0,
-            'matched_template': 'N/A'
-        })
-    
-    # Save to Excel
-    df = pd.DataFrame(results)
-    df.to_excel(output_file, index=False)
-    
-    elapsed_time = time.time() - start_time
-    print(f"\nAnalysis completed in {elapsed_time:.2f} seconds")
-    print(f"Results saved to {output_file}")
-    
-    return status, restriction_findings
+    print(f"Analysis complete. Found {len(results)} potential data sharing restrictions.")
+    print(f"Results saved to: {output_path}")
 
-# Script variables - set these before running
 if __name__ == "__main__":
-    # Configure these variables
-    input_file = "path/to/your/document.pdf"  # Path to document
-    output_file = "data_sharing_analysis.xlsx"  # Name of output Excel file
+    main()
+, sentence) and len(current_group) >= 3) or len(current_group) >= 4:
+                            result.append(" ".join(current_group))
+                            current_group = []
+                    if current_group:
+                        result.append(" ".join(current_group))
+            else:
+                # For shorter text, keep as a single paragraph
+                result.append(para.strip())
+                
+        # Check for section headers and split on them
+        final_result = []
+        for para in result:
+            # Look for section header patterns and split
+            header_matches = re.finditer(r'([A-Z][A-Z\s]+:|\d+\.\d+\s+[A-Z][\w\s]+)', para)
+            last_end = 0
+            for match in header_matches:
+                if match.start() > last_end:
+                    final_result.append(para[last_end:match.start()].strip())
+                final_result.append(para[match.start():match.end()].strip())
+                last_end = match.end()
+            if last_end < len(para):
+                final_result.append(para[last_end:].strip())
+        
+        # Remove empty paragraphs and very short ones that are likely noise
+        return [p for p in final_result if p.strip() and len(p.strip()) > 10]
     
-    print(f"Starting analysis of document: {input_file}")
-    status, findings = analyze_for_data_sharing_restrictions(input_file, output_file)
+    def _create_chunks_from_paragraphs(self, paragraphs: List[str], page_num: int) -> List[Dict[str, Any]]:
+        """Create overlapping chunks from paragraphs."""
+        chunks = []
+        current_chunk = ""
+        current_paragraphs = []
+        chunk_id = 1
+        
+        for para in paragraphs:
+            # If adding this paragraph exceeds chunk size, save current chunk and start new one
+            if len(current_chunk) + len(para) > self.chunk_size and current_chunk:
+                chunk_text = current_chunk.strip()
+                
+                # Get context (first and last paragraph)
+                context = (current_paragraphs[0][:100] + "..." if len(current_paragraphs[0]) > 100 else current_paragraphs[0])
+                if len(current_paragraphs) > 1:
+                    context += " [...] " + (current_paragraphs[-1][:100] + "..." if len(current_paragraphs[-1]) > 100 else current_paragraphs[-1])
+                
+                chunks.append({
+                    "chunk_id": f"page_{page_num}_chunk_{chunk_id}",
+                    "text": chunk_text,
+                    "page_num": page_num,
+                    "source": "text",
+                    "is_table": False,
+                    "context": context
+                })
+                
+                # Start new chunk with overlap
+                overlap_point = max(0, len(current_chunk) - self.chunk_overlap)
+                current_chunk = current_chunk[overlap_point:] + " " + para
+                current_paragraphs = [current_paragraphs[-1], para] if current_paragraphs else [para]
+                chunk_id += 1
+            else:
+                current_chunk += " " + para
+                current_paragraphs.append(para)
+        
+        # Add the last chunk if not empty
+        if current_chunk.strip():
+            chunk_text = current_chunk.strip()
+            
+            # Get context (first and last paragraph)
+            context = (current_paragraphs[0][:100] + "..." if len(current_paragraphs[0]) > 100 else current_paragraphs[0])
+            if len(current_paragraphs) > 1:
+                context += " [...] " + (current_paragraphs[-1][:100] + "..." if len(current_paragraphs[-1]) > 100 else current_paragraphs[-1])
+            
+            chunks.append({
+                "chunk_id": f"page_{page_num}_chunk_{chunk_id}",
+                "text": chunk_text,
+                "page_num": page_num,
+                "source": "text",
+                "is_table": False,
+                "context": context
+            })
+        
+        return chunks
     
-    # Final determination
-    print(f"\nFINAL DETERMINATION: {status}")
-    if status == "RESTRICTED":
-        print("⚠️ This document contains restrictions on data sharing for secondary research ⚠️")
-    elif status == "ALLOWED":
-        print("✅ This document does not restrict data sharing for secondary research")
-    else:
-        print("❌ Error analyzing document")
+    def _table_to_text(self, table_content: List[Dict[str, Any]]) -> str:
+        """Convert table dictionary to text representation."""
+        text = "TABLE CONTENT:\n"
+        
+        if not table_content:
+            return text + "Empty table"
+        
+        # Get all keys from the first row
+        keys = list(table_content[0].keys())
+        
+        # Create header
+        header = " | ".join(keys)
+        text += header + "\n"
+        text += "-" * len(header) + "\n"
+        
+        # Add rows
+        for row in table_content:
+            row_text = " | ".join(str(row.get(k, "")) for k in keys)
+            text += row_text + "\n"
+        
+        return text
+
+class EmbeddingGenerator:
+    """Generates embeddings for text chunks using a sentence transformer model."""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        """
+        Initialize the embedding generator with a lightweight model
+        
+        Args:
+            model_name: Name of the sentence-transformers model to use
+        """
+        logger.info(f"Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+        self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        logger.info(f"Embedding dimension: {self.embedding_dim}")
+    
+    def generate_embeddings(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Generate embeddings for all chunks
+        
+        Args:
+            chunks: List of text chunks
+            
+        Returns:
+            Chunks with added embedding vectors
+        """
+        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        
+        # Extract text from chunks
+        texts = [chunk["text"] for chunk in chunks]
+        
+        # Generate embeddings in batches to avoid memory issues
+        batch_size = 32
+        embeddings = []
+        
+        for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
+            batch_texts = texts[i:i+batch_size]
+            batch_embeddings = self.model.encode(batch_texts)
+            embeddings.extend(batch_embeddings)
+        
+        # Add embeddings to chunks
+        for i, chunk in enumerate(chunks):
+            chunk["embedding"] = embeddings[i]
+        
+        return chunks
+    
+    def generate_query_embeddings(self, queries: List[str]) -> np.ndarray:
+        """
+        Generate embeddings for search queries
+        
+        Args:
+            queries: List of query strings
+            
+        Returns:
+            Array of query embeddings
+        """
+        logger.info(f"Generating query embeddings for {len(queries)} queries")
+        query_embeddings = self.model.encode(queries)
+        return query_embeddings
+
+class RetrievalSystem:
+    """
+    Implements a vector retrieval system to find relevant chunks
+    related to data sharing restrictions.
+    """
+    
+    def __init__(self, embedding_dim: int):
+        """
+        Initialize the retrieval system
+        
+        Args:
+            embedding_dim: Dimension of the embeddings
+        """
+        logger.info(f"Initializing retrieval system with {embedding_dim} dimensions")
+        self.index = faiss.IndexFlatIP(embedding_dim)  # Inner product for cosine similarity
+        self.chunks = []
+    
+    def add_chunks(self, chunks: List[Dict[str, Any]]):
+        """
+        Add chunks to the retrieval index
+        
+        Args:
+            chunks: List of chunks with embeddings
+        """
+        embeddings = np.array([chunk["embedding"] for chunk in chunks]).astype(np.float32)
+        self.index.add(embeddings)
+        self.chunks = chunks
+        logger.info(f"Added {len(chunks)} chunks to retrieval index")
+    
+    def search(self, query_embeddings: np.ndarray, k: int = 10, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Search for relevant chunks using query embeddings
+        
+        Args:
+            query_embeddings: Embeddings of the search queries
+            k: Number of results to return per query
+            threshold: Minimum similarity score threshold
+            
+        Returns:
+            List of relevant chunks with similarity scores
+        """
+        logger.info(f"Searching for top {k} relevant chunks")
+        
+        # Ensure query_embeddings is 2D
+        if len(query_embeddings.shape) == 1:
+            query_embeddings = query_embeddings.reshape(1, -1)
+        
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(query_embeddings)
+        
+        # Search index
+        scores, indices = self.index.search(query_embeddings.astype(np.float32), k=k)
+        
+        # Collect results above threshold
+        results = []
+        seen_chunks = set()  # To avoid duplicates
+        
+        for query_idx, (query_scores, query_indices) in enumerate(zip(scores, indices)):
+            for score, idx in zip(query_scores, query_indices):
+                if idx < 0 or idx >= len(self.chunks):  # Skip invalid indices
+                    continue
+                    
+                if score < threshold:  # Skip results below threshold
+                    continue
+                
+                chunk = self.chunks[idx]
+                chunk_id = chunk["chunk_id"]
+                
+                if chunk_id in seen_chunks:  # Skip duplicates
+                    continue
+                
+                seen_chunks.add(chunk_id)
+                
+                results.append({
+                    **chunk,
+                    "similarity_score": float(score)
+                })
+        
+        # Sort by similarity score (descending)
+        results.sort(key=lambda x: x["similarity_score"], reverse=True)
+        
+        logger.info(f"Found {len(results)} relevant chunks above threshold {threshold}")
+        return results
+
+class DataSharingAnalyzer:
+    """
+    Analyzes retrieved chunks to identify data sharing restrictions
+    and assigns confidence scores.
+    """
+    
+    def __init__(self, use_llm: bool = False):
+        """
+        Initialize the data sharing analyzer
+        
+        Args:
+            use_llm: Whether to use LLM for analysis (uses rule-based method if False)
+        """
+        self.use_llm = use_llm
+        logger.info(f"Initializing data sharing analyzer (use_llm={use_llm})")
+        
+        if use_llm:
+            logger.info("Loading lightweight LLM for analysis...")
+            try:
+                # Choose a lightweight model suitable for CPU (Phi-2)
+                self.model_name = "microsoft/phi-2"
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                
+                # Load in 4-bit to reduce memory usage
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    device_map="auto",
+                    torch_dtype=torch.float16,  # If GPU available
+                    load_in_4bit=True,  # For CPU efficiency
+                )
+                logger.info("LLM loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load LLM: {e}. Falling back to rule-based analysis.")
+                self.use_llm = False
+        
+        # Initialize patterns for rule-based analysis
+        self._init_patterns()
+    
+    def _init_patterns(self):
+        """Initialize regex patterns for rule-based analysis."""
+        # Patterns indicating prohibition of data sharing
+        self.prohibition_patterns = [
+            r"data\s+(?:sharing|use)\s+(?:is|are)\s+(?:not|prohibited|forbidden|disallowed)",
+            r"(?:not|no)\s+(?:allowed|permitted)\s+to\s+(?:share|use|transfer)\s+(?:the|this|study)?\s*data",
+            r"data\s+(?:may|can|shall|must|will)\s+not\s+be\s+(?:shared|used|transferred|disclosed)",
+            r"(?:prohibit|restrict|limit|forbid)\s+(?:the|any|all)\s+(?:sharing|use|transfer)\s+of\s+(?:the|this|study)?\s*data",
+            r"data\s+(?:is|are)\s+exclusive(?:ly)?\s+for\s+(?:this|the|current)\s+(?:study|trial|research|use)",
+            r"secondary\s+(?:use|usage|research|analysis)\s+(?:is|are)\s+(?:not|never)\s+(?:permitted|allowed)",
+            r"(?:cannot|may\s+not|must\s+not|shall\s+not)\s+be\s+used\s+for\s+(?:secondary|other|future|additional)\s+(?:research|trials|studies|purposes)"
+        ]
+        
+        # Patterns indicating conditional data sharing
+        self.conditional_patterns = [
+            r"data\s+(?:may|can|could|might|shall)\s+be\s+(?:shared|used|transferred)\s+(?:only|if|when|subject\s+to|conditional)",
+            r"(?:approval|permission|consent|authorization)\s+(?:is|must\s+be|will\s+be|shall\s+be)\s+(?:required|necessary|needed|obtained)",
+            r"(?:prior|written|explicit|specific)\s+(?:approval|permission|consent|authorization)",
+            r"subject\s+to\s+(?:the|a|an)\s+(?:agreement|approval|authorization|permission)",
+            r"(?:ethics|IRB|institutional\s+review\s+board)\s+(?:approval|review|permission)",
+            r"data\s+(?:transfer|sharing|use)\s+agreement\s+(?:is|must\s+be|will\s+be|shall\s+be)\s+(?:required|necessary|needed|in\s+place)"
+        ]
+    
+    def analyze_chunks(self, relevant_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Analyze chunks to identify data sharing restrictions
+        
+        Args:
+            relevant_chunks: List of relevant chunks from retrieval system
+            
+        Returns:
+            List of analyzed chunks with restriction details and confidence scores
+        """
+        logger.info(f"Analyzing {len(relevant_chunks)} relevant chunks for data sharing restrictions")
+        
+        results = []
+        
+        for chunk in relevant_chunks:
+            if self.use_llm and hasattr(self, 'model'):
+                analysis = self._analyze_with_llm(chunk)
+            else:
+                analysis = self._analyze_with_rules(chunk)
+            
+            if analysis["has_restrictions"]:
+                results.append({
+                    "paragraph": chunk["text"],
+                    "confidence": analysis["confidence"],
+                    "page": chunk["page_num"],
+                    "restriction_type": analysis["restriction_type"],
+                    "context": chunk["context"]
+                })
+        
+        # Sort by confidence (descending)
+        results.sort(key=lambda x: x["confidence"], reverse=True)
+        
+        logger.info(f"Found {len(results)} chunks with data sharing restrictions")
+        return results
+    
+    def _analyze_with_rules(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze chunk using rule-based patterns."""
+        text = chunk["text"].lower()
+        
+        # Check for prohibition patterns
+        prohibition_matches = [
+            re.search(pattern, text, re.IGNORECASE) 
+            for pattern in self.prohibition_patterns
+        ]
+        prohibition_matches = [m for m in prohibition_matches if m]
+        
+        # Check for conditional patterns
+        conditional_matches = [
+            re.search(pattern, text, re.IGNORECASE) 
+            for pattern in self.conditional_patterns
+        ]
+        conditional_matches = [m for m in conditional_matches if m]
+        
+        # Determine restriction type and confidence
+        if prohibition_matches:
+            restriction_type = "PROHIBITED"
+            # More matches = higher confidence
+            confidence = min(95, 70 + 5 * len(prohibition_matches))
+            has_restrictions = True
+        elif conditional_matches:
+            restriction_type = "CONDITIONAL"
+            confidence = min(90, 60 + 5 * len(conditional_matches))
+            has_restrictions = True
+        else:
+            # Check for potential restrictions using keyword density
+            keywords = [
+                "confidential", "proprietary", "restrict", "limit", 
+                "exclusive", "only", "sole", "disclosure"
+            ]
+            
+            keyword_count = sum(1 for kw in keywords if kw in text)
+            
+            if keyword_count >= 3 and any(term in text for term in ["data", "information", "results"]):
+                restriction_type = "POTENTIAL"
+                confidence = min(60, 40 + 5 * keyword_count)
+                has_restrictions = True
+            else:
+                restriction_type = "NONE"
+                confidence = 0
+                has_restrictions = False
+        
+        return {
+            "has_restrictions": has_restrictions,
+            "restriction_type": restriction_type,
+            "confidence": confidence
+        }
+    
+    def _analyze_with_llm(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze chunk using LLM-based analysis."""
+        try:
+            # Create prompt for the LLM
+            prompt = f"""
+            Analyze the following text from a research document and determine if it contains 
+            restrictions on sharing data for secondary research or clinical trials.
+            
+            Text: {chunk['text']}
+            
+            Respond with a JSON object with these fields:
+            1. has_restrictions: true or false
+            2. restriction_type: "PROHIBITED" (cannot share at all), "CONDITIONAL" (can share with conditions), "POTENTIAL" (might have restrictions), or "NONE"
+            3. confidence: number from 0-100 representing confidence in the assessment
+            
+            JSON:
+            """
+            
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=100,
+                    temperature=0.1,
+                    top_p=0.9,
+                    top_k=40,
+                    repetition_penalty=1.1,
+                    num_return_sequences=1,
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = response.replace(prompt, "").strip()
+            
+            # Extract JSON from response
+            json_match = re.search(r'(\{.*\})', response, re.DOTALL)
+            if json_match:
+                analysis = json.loads(json_match.group(1))
+                return {
+                    "has_restrictions": analysis.get("has_restrictions", False),
+                    "restriction_type": analysis.get("restriction_type", "NONE"),
+                    "confidence": analysis.get("confidence", 0)
+                }
+            
+            # Fallback to rule-based if LLM failed
+            logger.warning("LLM returned invalid JSON response, falling back to rule-based analysis")
+            return self._analyze_with_rules(chunk)
+            
+        except Exception as e:
+            logger.warning(f"Error in LLM analysis: {e}, falling back to rule-based analysis")
+            return self._analyze_with_rules(chunk)
+
+class DataSharingDetector:
+    """
+    Main class that orchestrates the end-to-end process of detecting 
+    data sharing restrictions in documents.
+    """
+    
+    def __init__(
+        self,
+        use_llm: bool = False,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+        search_threshold: float = 0.5,
+        embedding_model: str = "all-MiniLM-L6-v2",
+        top_k: int = 20
+    ):
+        """
+        Initialize the data sharing detector
+        
+        Args:
+            use_llm: Whether to use LLM for analysis
+            chunk_size: Size of text chunks
+            chunk_overlap: Overlap between chunks
+            search_threshold: Similarity threshold for retrieval
+            embedding_model: Name of the embedding model to use
+            top_k: Number of top results to retrieve
+        """
+        self.use_llm = use_llm
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.search_threshold = search_threshold
+        self.embedding_model = embedding_model
+        self.top_k = top_k
+        
+        # Data sharing restriction queries
+        self.queries = [
+            "Data cannot be shared for secondary research",
+            "Data sharing for other clinical trials is prohibited",
+            "Restrictions on sharing data for future studies",
+            "Data may not be used for purposes beyond this study",
+            "Secondary use of data is not permitted",
+            "Data is exclusively for the current research only",
+            "Data sharing agreement is required for secondary use",
+            "Confidentiality restrictions prevent data sharing",
+            "Data cannot be transferred to other researchers",
+            "Authorization needed for data sharing"
+        ]
+        
+        # Initialize components
+        self.parser = DocumentParser()
+        self.text_processor = TextProcessor(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self.embedding_generator = EmbeddingGenerator(model_name=embedding_model)
+        
+        # Retrieval system will be initialized after we know the embedding dimension
+        self.embedding_dim = self.embedding_generator.embedding_dim
+        self.retrieval_system = RetrievalSystem(self.embedding_dim)
+        
+        # Analyzer
+        self.analyzer = DataSharingAnalyzer(use_llm=use_llm)
+        
+        logger.info("Data sharing detector initialized successfully")
+    
+    def process_document(self, file_path: str) -> List[Dict[str, Any]]:
+        """
+        Process a document to detect data sharing restrictions
+        
+        Args:
+            file_path: Path to the document file
+            
+        Returns:
+            List of detected data sharing restrictions
+        """
+        try:
+            start_time = time.time()
+            logger.info(f"Processing document: {file_path}")
+            
+            # Step 1: Parse the document
+            doc_content = self.parser.parse_document(file_path)
+            logger.info(f"Document parsed: {len(doc_content['pages'])} pages, {len(doc_content['tables'])} tables")
+            
+            # Step 2: Process text and create chunks
+            chunks = self.text_processor.process_document(doc_content)
+            
+            # Step 3: Generate embeddings for chunks
+            chunks_with_embeddings = self.embedding_generator.generate_embeddings(chunks)
+            
+            # Step 4: Add chunks to retrieval system
+            self.retrieval_system.add_chunks(chunks_with_embeddings)
+            
+            # Step 5: Generate query embeddings
+            query_embeddings = self.embedding_generator.generate_query_embeddings(self.queries)
+            
+            # Step 6: Retrieve relevant chunks
+            relevant_chunks = self.retrieval_system.search(
+                query_embeddings,
+                k=self.top_k,
+                threshold=self.search_threshold
+            )
+            
+            # Step 7: Analyze chunks for data sharing restrictions
+            results = self.analyzer.analyze_chunks(relevant_chunks)
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Document processed in {elapsed_time:.2f} seconds")
+            logger.info(f"Found {len(results)} potential data sharing restrictions")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            raise
+    
+    def save_results_to_excel(self, results: List[Dict[str, Any]], output_path: str):
+        """
+        Save analysis results to Excel file
+        
+        Args:
+            results: List of detected data sharing restrictions
+            output_path: Path to save the Excel file
+        """
+        try:
+            logger.info(f"Saving results to Excel: {output_path}")
+            
+            # Create DataFrame from results
+            df = pd.DataFrame(results)
+            
+            # Format confidence as percentage
+            df["confidence"] = df["confidence"].apply(lambda x: f"{x:.1f}%")
+            
+            # Save to Excel
+            df.to_excel(output_path, index=False)
+            
+            logger.info(f"Results saved successfully: {len(results)} entries")
+            
+        except Exception as e:
+            logger.error(f"Error saving results to Excel: {e}")
+            raise
+
+def main():
+    """Main function to demonstrate usage."""
+    
+    # Get inputs from user
+    file_path = input("Enter path to document file: ")
+    output_path = input("Enter path to save results (Excel): ")
+    use_llm = input("Use LLM for analysis? (y/n): ").lower() == 'y'
+    
+    # Set default output path if not provided
+    if not output_path:
+        output_path = "data_sharing_restrictions.xlsx"
+    
+    # Initialize detector
+    detector = DataSharingDetector(
+        use_llm=use_llm,
+        chunk_size=500,
+        chunk_overlap=100,
+        search_threshold=0.5,
+        top_k=20
+    )
+    
+    # Process document
+    results = detector.process_document(file_path)
+    
+    # Save results to Excel
+    detector.save_results_to_excel(results, output_path)
+    
+    print(f"Analysis complete. Found {len(results)} potential data sharing restrictions.")
+    print(f"Results saved to: {output_path}")
+
+if __name__ == "__main__":
+    main()
