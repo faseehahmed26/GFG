@@ -297,54 +297,41 @@ class TextProcessor:
         
         return text.strip()
     
-    def _split_into_paragraphs(self, text: str) -> List[str]:
-        """Split text into paragraphs using NLTK and semantic breaks."""
-        # Make sure NLTK data is downloaded
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except LookupError:
-            logger.info("Downloading NLTK punkt tokenizer data...")
-            nltk.download('punkt', quiet=True)
-        
-        try:
-            nltk.data.find('corpora/stopwords')
-        except LookupError:
-            logger.info("Downloading NLTK stopwords data...")
-            nltk.download('stopwords', quiet=True)
-            
-        # First split by obvious paragraph breaks (double newlines)
-        initial_paragraphs = re.split(r'\n\s*\n', text)
-        result = []
-        
-        for para in initial_paragraphs:
-            # Skip very short segments
-            if len(para.strip()) < 20:
-                if para.strip():
-                    result.append(para.strip())
-                continue
-                
-            # Use NLTK sentence tokenization
-            sentences = sent_tokenize(para)
-            
-            # Group sentences into semantic paragraphs
-            if len(sentences) > 5:
-                # For longer text, use TextTiling to find topic boundaries
-                try:
-                    tt = TextTilingTokenizer()
-                    segments = tt.tokenize(para)
-                    for segment in segments:
-                        if segment.strip():
-                            result.append(segment.strip())
-                except Exception as e:
-                    # Fall back to simpler method if TextTiling fails
-                    logger.warning(f"TextTiling failed: {e}. Using sentence grouping instead.")
-                    current_group = []
-                    for sentence in sentences:
-                        current_group.append(sentence)
-                        # Start a new paragraph after sentences that end with certain punctuation
-                        # or when we have 3-4 sentences
-                        if (re.search(r'[.!?:]\s*
     
+def split_into_paragraphs(text: str) -> List[str]:
+    """Split text into paragraphs using a simpler approach with NLTK."""
+    # Download NLTK data if needed
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+    
+    # Split by paragraph breaks
+    paragraphs = re.split(r'\n\s*\n', text)
+    
+    result = []
+    for para in paragraphs:
+        # Skip empty paragraphs
+        if not para.strip():
+            continue
+            
+        # Check for section headers
+        header_match = re.search(r'^([A-Z][A-Z\s]+:|\d+\.\d+\s+[A-Z][\w\s]+)', para.strip())
+        if header_match:
+            # If it starts with a header, split it
+            header = header_match.group(0)
+            content = para[header_match.end():].strip()
+            
+            if header:
+                result.append(header)
+            if content:
+                result.append(content)
+        else:
+            # Regular paragraph
+            result.append(para.strip())
+    
+    # Filter out very short paragraphs
+    return [p for p in result if len(p) > 10]
     def _create_chunks_from_paragraphs(self, paragraphs: List[str], page_num: int) -> List[Dict[str, Any]]:
         """Create overlapping chunks from paragraphs."""
         chunks = []
